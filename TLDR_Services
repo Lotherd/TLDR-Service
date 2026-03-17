@@ -1,5 +1,6 @@
 // ── Constants ────────────────────────────────────────────────────────────────
 
+// Section headers for each TLDR newsletter variant, used to split parsed content
 const NEWSLETTER_CATEGORIES = {
   "TLDR": [
     "BIG TECH & STARTUPS",
@@ -21,12 +22,14 @@ const NEWSLETTER_CATEGORIES = {
   ]
 };
 
+// Regex patterns to match different article formats in newsletter plain text
 const ARTICLE_PATTERN = /^(.+?)\s*\(\d+\s*MINUTE READ\)\s*\[(\d+)\]/i;
 const GITHUB_REPO_PATTERN = /^(.+?)\s*\(GitHub Repo\)\s*\[(\d+)\]/i;
 const QUICK_LINK_PATTERN = /^(.+?)\s*\[(\d+)\]\s*$/;
 const URL_PATTERN = /\[(\d+)\]\s*(https?:\/\/[^\s\n]+)/g;
+
 const GMAIL_QUERY = "from:tldr";
-const MAX_THREADS = 20;
+const MAX_THREADS = 20; // GAS quota safeguard
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -48,6 +51,7 @@ function setupProperties() {
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 
+// Identifies newsletter variant from subject/body to select correct category headers
 function detectNewsletterType(subject, body) {
   const upper = subject.toUpperCase();
   if (upper.includes("TLDR DEV") || body.includes("TLDR DEV")) return "TLDR DEV";
@@ -55,6 +59,7 @@ function detectNewsletterType(subject, body) {
   return "TLDR";
 }
 
+// Builds a lookup map of [N] → URL from reference-style links in the email body
 function extractUrlMap(body) {
   const urlMap = {};
   let match;
@@ -64,6 +69,7 @@ function extractUrlMap(body) {
   return urlMap;
 }
 
+// Merges lines that were soft-wrapped in the email into single logical lines
 function joinWrappedLines(lines, categories) {
   return lines.reduce((acc, raw) => {
     const trimmed = raw.trim();
@@ -86,6 +92,7 @@ function joinWrappedLines(lines, categories) {
   }, []);
 }
 
+// First-pass extraction of GitHub repo entries with their descriptions
 function extractGitHubRepos(contentBody, urlMap) {
   const repos = [];
   const lines = contentBody.split("\n");
@@ -119,6 +126,7 @@ function extractGitHubRepos(contentBody, urlMap) {
   return repos;
 }
 
+// Three-pass parser: (1) URL map, (2) GitHub repos, (3) articles by category
 function parseEmail(body, newsletterType) {
   const categories = NEWSLETTER_CATEGORIES[newsletterType];
   if (!categories) return [];
@@ -182,6 +190,7 @@ function parseEmail(body, newsletterType) {
   return articles.concat(githubRepos);
 }
 
+// Collects consecutive non-empty lines after an article entry as its description
 function collectDescription(lines, startIndex) {
   const descLines = [];
 
@@ -203,6 +212,7 @@ function collectDescription(lines, startIndex) {
 
 // ── Slack ────────────────────────────────────────────────────────────────────
 
+// Formats articles into Slack mrkdwn: grouped by category with links and descriptions
 function buildSlackMessage(subject, articles) {
   const blocks = [`📩 *${subject}*\n`];
   let currentCategory = null;
@@ -232,6 +242,7 @@ function buildSlackMessage(subject, articles) {
   return blocks.join("\n");
 }
 
+// Posts message to Slack via webhook; throws on non-200 response
 function sendToSlack(webhookUrl, message) {
   const response = UrlFetchApp.fetch(webhookUrl, {
     method: "post",
@@ -248,6 +259,7 @@ function sendToSlack(webhookUrl, message) {
 
 // ── Main Pipeline ────────────────────────────────────────────────────────────
 
+// Entry point: searches Gmail for unread TLDR threads, parses and forwards to Slack
 function processEmails() {
   const webhookUrl = getSlackWebhookUrl();
   const threads = GmailApp.search(GMAIL_QUERY, 0, MAX_THREADS);
