@@ -1,0 +1,288 @@
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const NEWSLETTER_CATEGORIES = {
+  "TLDR": [
+    "BIG TECH & STARTUPS",
+    "SCIENCE & FUTURISTIC TECHNOLOGY",
+    "PROGRAMMING, DESIGN & DATA SCIENCE",
+    "QUICK LINKS"
+  ],
+  "TLDR DEV": [
+    "ARTICLES & TUTORIALS",
+    "OPINIONS & ADVICE",
+    "LAUNCHES & TOOLS",
+    "QUICK LINKS"
+  ],
+  "TLDR AI": [
+    "HEADLINES & LAUNCHES",
+    "DEEP DIVES & ANALYSIS",
+    "ENGINEERING & RESEARCH",
+    "QUICK LINKS"
+  ]
+};
+
+const ARTICLE_PATTERN = /^(.+?)\s*\(\d+\s*MINUTE READ\)\s*\[(\d+)\]/i;
+const GITHUB_REPO_PATTERN = /^(.+?)\s*\(GitHub Repo\)\s*\[(\d+)\]/i;
+const QUICK_LINK_PATTERN = /^(.+?)\s*\[(\d+)\]\s*$/;
+const URL_PATTERN = /\[(\d+)\]\s*(https?:\/\/[^\s\n]+)/g;
+const GMAIL_QUERY = "from:tldr";
+const MAX_THREADS = 20;
+
+// ── Config ───────────────────────────────────────────────────────────────────
+
+function getSlackWebhookUrl() {
+  const url = PropertiesService.getScriptProperties().getProperty("SLACK_WEBHOOK_URL");
+  if (!url) throw new Error("SLACK_WEBHOOK_URL not set. Run setupProperties() first.");
+  return url;
+}
+
+/**
+ * Run ONCE from the GAS editor to set your Slack webhook URL.
+ */
+function setupProperties() {
+  PropertiesService.getScriptProperties().setProperties({
+    SLACK_WEBHOOK_URL: "YOUR_SLACK_WEBHOOK_URL"
+  });
+  Logger.log("Properties saved successfully.");
+}
+
+// ── Parsing ──────────────────────────────────────────────────────────────────
+
+function detectNewsletterType(subject, body) {
+  const upper = subject.toUpperCase();
+  if (upper.includes("TLDR DEV") || body.includes("TLDR DEV")) return "TLDR DEV";
+  if (upper.includes("TLDR AI") || body.includes("TLDR AI")) return "TLDR AI";
+  return "TLDR";
+}
+
+function extractUrlMap(body) {
+  const urlMap = {};
+  let match;
+  while ((match = URL_PATTERN.exec(body)) !== null) {
+    urlMap[match[1]] = match[2];
+  }
+  return urlMap;
+}
+
+function joinWrappedLines(lines, categories) {
+  return lines.reduce((acc, raw) => {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      acc.push("");
+      return acc;
+    }
+
+    const prev = acc[acc.length - 1];
+    const isCategory = categories.some(cat => trimmed.toUpperCase().includes(cat));
+    const prevEndsWithRef = prev && prev.match(/\[\d+\]$/);
+
+    if (prev && !prevEndsWithRef && !isCategory && !trimmed.match(/^\[/)) {
+      acc[acc.length - 1] = prev + " " + trimmed;
+    } else {
+      acc.push(trimmed);
+    }
+
+    return acc;
+  }, []);
+}
+
+function extractGitHubRepos(contentBody, urlMap) {
+  const repos = [];
+  const lines = contentBody.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const repoMatch = line.match(GITHUB_REPO_PATTERN);
+    if (repoMatch) {
+      // Grab the next non-empty line as description if available
+      let description = "";
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j].trim();
+        if (!next) break;
+        if (next.match(GITHUB_REPO_PATTERN)) break;
+        if (next.match(ARTICLE_PATTERN)) break;
+        if (next.match(/^\[/)) break;
+        description += (description ? " " : "") + next;
+      }
+
+      repos.push({
+        category: "GITHUB REPOS",
+        title: repoMatch[1].trim(),
+        url: urlMap[repoMatch[2]] || "",
+        description: description
+      });
+    }
+  }
+
+  return repos;
+}
+
+function parseEmail(body, newsletterType) {
+  const categories = NEWSLETTER_CATEGORIES[newsletterType];
+  if (!categories) return [];
+
+  const urlMap = extractUrlMap(body);
+  const contentBody = body.split(/Love TLDR\?/i)[0];
+
+  // First pass: extract ALL GitHub Repos from raw body
+  const githubRepos = extractGitHubRepos(contentBody, urlMap);
+
+  // Second pass: parse everything else from joined lines
+  const joinedLines = joinWrappedLines(contentBody.split("\n"), categories);
+  const articles = [];
+  let currentCategory = null;
+  let isQuickLinks = false;
+
+  for (let i = 0; i < joinedLines.length; i++) {
+    const line = joinedLines[i];
+    if (!line) continue;
+
+    // Skip GitHub Repo lines — already captured in first pass
+    if (line.match(GITHUB_REPO_PATTERN)) continue;
+
+    const matchedCategory = categories.find(cat => line.toUpperCase().includes(cat));
+
+    if (matchedCategory) {
+      currentCategory = matchedCategory;
+      isQuickLinks = matchedCategory === "QUICK LINKS";
+      continue;
+    }
+
+    if (!currentCategory) continue;
+
+    if (isQuickLinks) {
+      const quickMatch = line.match(QUICK_LINK_PATTERN);
+      if (quickMatch) {
+        const description = collectDescription(joinedLines, i + 1);
+        articles.push({
+          category: currentCategory,
+          title: quickMatch[1].trim(),
+          url: urlMap[quickMatch[2]] || "",
+          description: description
+        });
+      }
+      continue;
+    }
+
+    const articleMatch = line.match(ARTICLE_PATTERN);
+    if (articleMatch) {
+      const description = collectDescription(joinedLines, i + 1);
+      articles.push({
+        category: currentCategory,
+        title: articleMatch[1].trim(),
+        url: urlMap[articleMatch[2]] || "",
+        description: description
+      });
+    }
+  }
+
+  // Append GitHub Repos at the end as their own section
+  return articles.concat(githubRepos);
+}
+
+function collectDescription(lines, startIndex) {
+  const descLines = [];
+
+  for (let j = startIndex; j < lines.length; j++) {
+    const line = lines[j];
+
+    // Stop at empty lines, next article, category header, or URL reference
+    if (!line) break;
+    if (line.match(ARTICLE_PATTERN)) break;
+    if (line.match(GITHUB_REPO_PATTERN)) break;
+    if (line.match(QUICK_LINK_PATTERN)) break;
+    if (line.match(/^\[/)) break;
+
+    descLines.push(line);
+  }
+
+  return descLines.join(" ").trim();
+}
+
+// ── Slack ────────────────────────────────────────────────────────────────────
+
+function buildSlackMessage(subject, articles) {
+  const blocks = [`📩 *${subject}*\n`];
+  let currentCategory = null;
+
+  for (const article of articles) {
+    if (article.category !== currentCategory) {
+      blocks.push("");
+      blocks.push(`*── ${article.category} ──*`);
+      currentCategory = article.category;
+    }
+
+    const isQuickLink = article.category === "QUICK LINKS";
+
+    if (isQuickLink) {
+      const link = article.url ? `<${article.url}|${article.title}>` : article.title;
+      const desc = article.description ? ` — ${article.description}` : "";
+      blocks.push(`  • ${link}${desc}`);
+    } else {
+      const link = article.url ? `<${article.url}|${article.title}>` : article.title;
+      blocks.push(`  • ${link}`);
+      if (article.description) {
+        blocks.push(`    _${article.description}_`);
+      }
+    }
+  }
+
+  return blocks.join("\n");
+}
+
+function sendToSlack(webhookUrl, message) {
+  const response = UrlFetchApp.fetch(webhookUrl, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ text: message }),
+    muteHttpExceptions: true
+  });
+
+  const code = response.getResponseCode();
+  if (code !== 200) {
+    throw new Error(`Slack responded with ${code}: ${response.getContentText()}`);
+  }
+}
+
+// ── Main Pipeline ────────────────────────────────────────────────────────────
+
+function processEmails() {
+  const webhookUrl = getSlackWebhookUrl();
+  const threads = GmailApp.search(GMAIL_QUERY, 0, MAX_THREADS);
+  const unreadThreads = threads.filter(thread => thread.isUnread());
+
+  Logger.log(`Threads: ${threads.length} total, ${unreadThreads.length} unread`);
+
+  let processed = 0;
+  let failed = 0;
+
+  for (const thread of unreadThreads) {
+    const messages = thread.getMessages();
+    const msg = messages[messages.length - 1];
+    const subject = (msg.getSubject() || "").trim();
+    const body = (msg.getPlainBody() || "").trim();
+
+    const newsletterType = detectNewsletterType(subject, body);
+    const articles = parseEmail(body, newsletterType);
+
+    if (articles.length === 0) {
+      Logger.log(`No articles found in: ${subject}`);
+      thread.markRead();
+      continue;
+    }
+
+    try {
+      sendToSlack(webhookUrl, buildSlackMessage(subject, articles));
+      thread.markRead();
+      processed++;
+      Logger.log(`✓ ${subject} (${articles.length} articles)`);
+    } catch (error) {
+      failed++;
+      Logger.log(`✗ ${subject}: ${error.message}`);
+    }
+  }
+
+  Logger.log(`Done: ${processed} sent, ${failed} failed`);
+}
